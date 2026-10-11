@@ -1,0 +1,19 @@
+{
+  "id": "juice-compact",
+  "name": "Juice Compact",
+  "description": "Compacts noisy exec/bash tool output before it re-enters the session.",
+  "version": "1.0.2",
+  "configSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "exec-juice"
+    ]
+  }
+}
