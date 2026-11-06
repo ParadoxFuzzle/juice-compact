@@ -22,10 +22,55 @@ function clampBudget(n) {
     const v = typeof n === "number" && Number.isFinite(n) ? n : DEFAULT_BUDGET;
     return Math.round(Math.max(MIN_BUDGET, Math.min(MAX_BUDGET, v)));
 }
+// Refused regardless of allowlist unless denyDestructive is explicitly false.
+// Deliberately narrow: these are "this ends the machine" shapes, not a
+// general safety filter. Anything beyond this is the operator's call.
+const DESTRUCTIVE_PATTERNS = [
+    { id: "rm-root", re: /\brm\s+(?:-[^\s]+\s+)*-[^\s]*[rf][^\s]*\s+(?:\/|~|\$HOME)\s*$/i },
+    { id: "rm-root-glob", re: /\brm\s+(?:-[^\s]+\s+)*-[^\s]*[rf][^\s]*\s+(?:\/|~)\*/i },
+    { id: "mkfs", re: /\bmkfs(?:\.\w+)?\b/i },
+    { id: "dd-device", re: /\bdd\b[^\n]*\bof=\/dev\//i },
+    { id: "fork-bomb", re: /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&\s*\}\s*;\s*:/ },
+    { id: "chmod-root", re: /\bchmod\s+(?:-R\s+)?777\s+\/(?:\s|$)/i },
+    { id: "curl-pipe-shell", re: /\b(?:curl|wget)\b[^|\n]{0,200}\|\s*(?:sudo\s+)?(?:ba|z|k)?sh\b/i },
+    { id: "wipe-device", re: /\b(?:shred|wipefs)\b[^\n]*\/dev\//i },
+];
+export function checkCommand(command, cfg = {}) {
+    const c = cfg;
+    if (c.allowExec === false) {
+        return { allowed: false, reason: "shell execution disabled by config (allowExec: false)", rule: "allowExec" };
+    }
+    if (typeof command !== "string" || !command.trim()) {
+        return { allowed: false, reason: "empty command", rule: "empty" };
+    }
+    if (c.denyDestructive !== false) {
+        for (const { id, re } of DESTRUCTIVE_PATTERNS) {
+            if (re.test(command)) {
+                return { allowed: false, reason: `destructive command blocked (${id}); set denyDestructive: false to permit`, rule: id };
+            }
+        }
+    }
+    const allow = Array.isArray(c.allowedCommands)
+        ? c.allowedCommands.filter((x) => typeof x === "string" && x.trim().length > 0)
+        : [];
+    if (allow.length > 0 && !allow.some((prefix) => command.trim().startsWith(prefix.trim()))) {
+        return { allowed: false, reason: "command is outside the configured allowedCommands allowlist", rule: "allowlist" };
+    }
+    return { allowed: true };
+}
 export default defineToolPlugin({
     id: "juice-compact",
     name: "Juice Compact",
     description: "Compacts noisy exec/bash tool output before it re-enters the session.",
+    configSchema: {
+        type: "object",
+        properties: {
+            allowExec: { type: "boolean", default: true },
+            allowedCommands: { type: "array", items: { type: "string" }, default: [] },
+            denyDestructive: { type: "boolean", default: true },
+        },
+        additionalProperties: false,
+    },
     tools: (tool) => [
         tool({
             name: "exec-juice",
@@ -35,7 +80,14 @@ export default defineToolPlugin({
                 cwd: Type.Optional(Type.String({ description: "Working directory." })),
                 max_result_chars: Type.Optional(Type.Number({ description: "Compacted result budget in chars (200-20000, default 4000)." })),
             }),
-            execute: async ({ command, cwd, max_result_chars }) => {
+            execute: async ({ command, cwd, max_result_chars }, 
+            // The SDK hands plugin config through as an opaque record; validate it
+            // inside checkCommand rather than casting it at the call site.
+            config) => {
+                const verdict = checkCommand(command, config);
+                if (!verdict.allowed) {
+                    return textResult(`exec-juice refused: ${verdict.reason}`, { ok: false, refused: verdict.rule ?? "policy" });
+                }
                 return compactExec(command, cwd || undefined, clampBudget(max_result_chars));
             },
         }),

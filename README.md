@@ -63,3 +63,49 @@ cd /home/noodly/.openclaw/plugin-src/juice-compact && npm test
 13 tests cover: ANSI stripping, dedup savings, error/warning extraction,
 head/tail split on over-budget output, empty output, stderr merging,
 exit-code preservation, and the compaction stats delta.
+
+## Security and gating
+
+`exec-juice` runs a shell command **with the gateway's own privileges**. That is
+the feature, and it is the risk: anything the agent can be talked into running,
+this tool can run. Three config keys bound that surface:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `allowExec` | `true` | Master switch. `false` makes `exec-juice` refuse every command while keeping the plugin loaded. |
+| `denyDestructive` | `true` | Refuses machine-destroying shapes regardless of allowlist: `rm -rf /` or `~`, `mkfs`, `dd of=/dev/*`, fork bombs, `chmod 777 /`, `curl\|sh` style pipes, `shred/wipefs` on devices. |
+| `allowedCommands` | `[]` | If non-empty, the command must **start with** one of these prefixes (e.g. `["npm ", "git ", "pytest "]`). Empty means no prefix restriction. |
+
+Example lockdown — read-only-ish build tooling only:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "juice-compact": {
+        "enabled": true,
+        "config": {
+          "allowExec": true,
+          "denyDestructive": true,
+          "allowedCommands": ["npm ", "pnpm ", "git ", "cargo ", "pytest "]
+        }
+      }
+    }
+  }
+}
+```
+
+To disable shell execution entirely without uninstalling:
+
+```json
+{ "plugins": { "entries": { "juice-compact": { "config": { "allowExec": false } } } } }
+```
+
+What this does **not** do: it is not a sandbox, not a seccomp profile, and not a
+substitute for running the gateway as an unprivileged user. A command that is
+not destructive by shape (e.g. `cat ~/.ssh/id_rsa`) still matches no rule. The
+prefix allowlist is the strongest lever; use it when the workload is known.
+
+Refusals are returned as a normal tool result with `ok: false` and a `refused`
+field naming the rule, so the agent sees *why* nothing ran instead of a silent
+empty result.
