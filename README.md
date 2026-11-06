@@ -60,6 +60,6 @@ warnings: 4
 cd /home/noodly/.openclaw/plugin-src/juice-compact && npm test
 ```
 
-9 tests cover: ANSI stripping, dedup savings, error/warning extraction,
+13 tests cover: ANSI stripping, dedup savings, error/warning extraction,
 head/tail split on over-budget output, empty output, stderr merging,
 exit-code preservation, and the compaction stats delta.

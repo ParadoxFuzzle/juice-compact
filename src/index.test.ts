@@ -70,3 +70,29 @@ describe("compactLines", () => {
     expect(out.stats.dupSaved).toBe(99);
   });
 });
+
+describe("compactLines hardening", () => {
+  it("clamps out-of-range budgets", () => {
+    const out = compactLines("x".repeat(5000), "", 5, 0, 1);
+    expect(out.text.length).toBeLessThan(1200);
+  });
+
+  it("strips OSC title sequences too", () => {
+    const out = compactLines("a\u001b]0;window title\u0007b", "", 4000, 0, 1);
+    expect(out.text).not.toContain("\u001b]");
+    expect(out.text).toContain("ab");
+  });
+
+  it("surfaces timeout and buffer-overflow notes", () => {
+    const t = compactLines("x", "", 4000, 124, 120000, { timedOut: true });
+    expect(t.text).toContain("timed out");
+    expect(t.text).toContain("exit: 124");
+    const o = compactLines("x", "", 4000, 1, 5, { overflow: true });
+    expect(o.text).toContain("8 MiB buffer");
+  });
+
+  it("never reports a negative middle-line count", () => {
+    const out = compactLines("only line", "", 4000, 0, 1);
+    expect(out.text).not.toContain("middle lines trimmed");
+  });
+});

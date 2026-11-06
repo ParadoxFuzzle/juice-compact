@@ -1,6 +1,34 @@
 import { Type } from "./typebox.js";
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
 import { textResult } from "openclaw/plugin-sdk/tool-results";
+import { exec as childExec, type ExecOptions } from "node:child_process";
+import { promisify } from "node:util";
+import * as fs from "node:fs";
+
+const execAsync = promisify(childExec);
+
+const DEFAULT_BUDGET = 4000;
+const MIN_BUDGET = 200;
+const MAX_BUDGET = 20_000;
+const TIMEOUT_MS = 120_000;
+const MAX_BUFFER = 8 * 1024 * 1024;
+
+// CSI + OSC + charset-select escapes. OSC is terminated by BEL or ST (ESC \).
+const ANSI_RE = new RegExp(
+  "\\u001b\\[[0-9;?]*[a-zA-Z]|\\u001b\\][^\\u0007\\u001b]*(?:\\u0007|\\u001b\\\\)|\\u001b[()][A-Z0-9]",
+  "g"
+);
+
+/** bash when present, the platform default shell otherwise (no hardcoded /bin/bash). */
+function shellForPlatform(): string | undefined {
+  if (process.platform === "win32") return process.env.ComSpec || undefined;
+  return fs.existsSync("/bin/bash") ? "/bin/bash" : undefined;
+}
+
+function clampBudget(n: number | undefined): number {
+  const v = typeof n === "number" && Number.isFinite(n) ? n : DEFAULT_BUDGET;
+  return Math.round(Math.max(MIN_BUDGET, Math.min(MAX_BUDGET, v)));
+}
 
 export default defineToolPlugin({
   id: "juice-compact",
@@ -11,45 +39,55 @@ export default defineToolPlugin({
     tool({
       name: "exec-juice",
       description:
-        "Run a shell command and return a compacted, structured summary of its output: stripped ANSI, head+tail truncation, deduplicated repeated lines, per-line classified (errors/warnings/hints), with the raw tail attached on failure. Exit code is always preserved exactly.",
+        "Run a shell command and return a compacted, structured summary of its output: stripped ANSI, head+tail truncation, deduplicated repeated lines, per-line classified (errors/warnings/hints), with the raw tail attached on failure. Exit code is always preserved exactly (124 on timeout).",
       parameters: Type.Object({
         command: Type.String({ description: "The shell command to run." }),
         cwd: Type.Optional(Type.String({ description: "Working directory." })),
         max_result_chars: Type.Optional(
-          Type.Number({ description: "Compacted result budget in chars (default 4000)." })
+          Type.Number({ description: "Compacted result budget in chars (200-20000, default 4000)." })
         ),
       }),
       execute: async ({ command, cwd, max_result_chars }: { command: string; cwd?: string; max_result_chars?: number }) => {
-        return compactExec(command, cwd || undefined, max_result_chars ?? 4000);
+        return compactExec(command, cwd || undefined, clampBudget(max_result_chars));
       },
     }),
   ],
 });
 
-import { exec as childExec } from "node:child_process";
-import { promisify } from "node:util";
-
-const execAsync = promisify(childExec);
-const ANSI_RE = new RegExp(
-  "\u001b\\[[0-9;]*[a-zA-Z]|\u001b\\][^\u0007]*\u0007",
-  "g"
-);
-
 async function compactExec(command: string, cwd: string | undefined, budget: number) {
   const t0 = Date.now();
+  const shell = shellForPlatform();
+  const options: ExecOptions = {
+    cwd,
+    timeout: TIMEOUT_MS,
+    maxBuffer: MAX_BUFFER,
+    ...(shell ? { shell } : {}),
+  };
   try {
-    const { stdout, stderr } = await execAsync(command, {
-      cwd,
-      timeout: 120000,
-      maxBuffer: 1024 * 1024 * 8,
-      shell: "/bin/bash",
-    });
-    const out = compactLines(stdout, stderr, budget, 0, Date.now() - t0);
+    const { stdout, stderr } = await execAsync(command, options);
+    // Modern @types/node types exec output as string | Buffer unless an
+    // encoding is pinned; normalise so the pure function always sees text.
+    const asText = (v: unknown) => (typeof v === "string" ? v : Buffer.isBuffer(v) ? v.toString("utf8") : "");
+    const out = compactLines(asText(stdout), asText(stderr), budget, 0, Date.now() - t0);
     return textResult(out.text, out.stats);
   } catch (err: unknown) {
-    const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string };
-    const code = typeof e.code === "number" ? e.code : 1;
-    const out = compactLines(e.stdout || "", e.stderr || e.message || "", budget, code, Date.now() - t0);
+    const e = err as {
+      code?: unknown;
+      signal?: unknown;
+      killed?: boolean;
+      stdout?: string;
+      stderr?: string;
+      message?: string;
+    };
+    // node's exec kills the child on timeout; report it as 124 (timeout)
+    // instead of collapsing every failure to 1.
+    const timedOut = e.killed === true || e.signal === "SIGTERM";
+    const overflow = e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+    const code = timedOut ? 124 : typeof e.code === "number" ? e.code : 1;
+    const out = compactLines(e.stdout || "", e.stderr || e.message || "", budget, code, Date.now() - t0, {
+      timedOut,
+      overflow,
+    });
     return textResult(out.text, out.stats);
   }
 }
@@ -60,53 +98,73 @@ export function compactLines(
   stderr: string,
   budget: number,
   exitCode: number,
-  ms: number
+  ms: number,
+  flags: { timedOut?: boolean; overflow?: boolean } = {}
 ): { text: string; stats: { exitCode: number; rawLen: number; compacted: number; dupSaved: number } } {
-  const clean = (s: string) => s.replace(ANSI_RE, "");
-  let all = (clean(stdout || "") + (clean(stderr || "") ? "\n[stderr]\n" + clean(stderr) : "")).trim();
+  const clean = (s: string) => (s || "").replace(ANSI_RE, "");
+  const cleanedStderr = clean(stderr);
+  const all = (clean(stdout) + (cleanedStderr ? "\n[stderr]\n" + cleanedStderr : "")).trim();
   const rawLen = all.length;
-  if (!all) all = "(no output)";
+  const body = rawLen ? all : "(no output)";
 
+  const lines = body.split("\n").filter((l) => l.trim().length > 0);
+  const seen = new Set<string>();
   const kept: string[] = [];
-  const seenCounts: Record<string, number> = {};
-  for (const line of all.split("\n").filter((l) => l.trim().length > 0)) {
-    if (seenCounts[line] !== undefined) {
-      seenCounts[line]++;
-      continue;
-    }
-    seenCounts[line] = 1;
+  for (const line of lines) {
+    if (seen.has(line)) continue;
+    seen.add(line);
     kept.push(line);
   }
-  const dedup = kept.length;
-  const dupSaved = (all.split("\n").filter((l) => l.trim().length > 0).length) - dedup;
+  const dupSaved = lines.length - kept.length;
 
   // Classify each line
-  const isErr = (l: string) => /^[a-z]+: (fatal|error|warning:|error:)/i.test(l) || /error:/i.test(l);
+  const isErr = (l: string) => /error:/i.test(l) || /^[a-z]+: (fatal|error)/i.test(l);
   const isWarn = (l: string) => /warn(?:ing)?:/i.test(l);
-  const errs = kept.filter((l: string) => isErr(l));
-  const warns = kept.filter((l: string) => isWarn(l));
+  const errs = kept.filter(isErr);
+  const warns = kept.filter(isWarn);
 
   // Budget: head 2/3, tail 1/3
-  const headBudget = Math.floor(budget * 2 / 3);
-  const head = kept.join("\n").slice(0, headBudget);
-  const tail = kept.join("\n").slice(-Math.floor(budget / 3));
-  const middle = kept.length - head.split("\n").length - tail.split("\n").length;
+  const safeBudget = clampBudget(budget);
+  const headBudget = Math.max(1, Math.floor((safeBudget * 2) / 3));
+  const tailBudget = Math.max(1, Math.floor(safeBudget / 3));
+  const joined = kept.join("\n");
+  const head = joined.slice(0, headBudget);
+  const tail = joined.slice(-tailBudget);
+  // Count real lines on each side of the split (the old code derived this from
+  // the character slices and could report a negative "middle lines" count).
+  const headLines = head ? head.split("\n").length : 0;
+  const tailLines = tail ? tail.split("\n").length : 0;
+  const middle = Math.max(0, kept.length - headLines - tailLines);
 
-  const summary = [
-    `exit: ${exitCode}`,
-    `duration: ${ms}ms`,
-    `raw: ${rawLen} chars → compacted: ${Math.min(rawLen, budget)} chars`,
-    `lines: ${kept.length} unique (+${dupSaved} duplicates trimmed)`,
-    errs.length ? `errors: ${errs.length}` : "",
-    warns.length ? `warnings: ${warns.length}` : "",
-    errs.length >= 1 ? `\nkey errors:\n  ${errs.slice(0, 5).join("\n  ")}` : "",
-    warns.length >= 1 ? `\nkey warnings:\n  ${warns.slice(0, 5).join("\n  ")}` : "",
-    "",
-  ].filter((s) => s !== "").join("\n");
+  const notes: string[] = [];
+  if (flags.timedOut) notes.push(`timed out after ${TIMEOUT_MS / 1000}s`);
+  if (flags.overflow) notes.push(`output exceeded ${MAX_BUFFER / (1024 * 1024)} MiB buffer (truncated)`);
 
-  const text = middle > 0
-    ? `${summary}--- head ---\n${head}\n[...${middle} middle lines trimmed...]\n--- tail ---\n${tail}`
-    : `${summary}\n${head}${tail === head ? "" : "\n--- tail ---\n" + tail}`;
+  const render = (compactedChars: number): string => {
+    const summary = [
+      `exit: ${exitCode}`,
+      `duration: ${ms}ms`,
+      `raw: ${rawLen} chars → compacted: ${compactedChars} chars`,
+      `lines: ${kept.length} unique (+${dupSaved} duplicates trimmed)`,
+      errs.length ? `errors: ${errs.length}` : "",
+      warns.length ? `warnings: ${warns.length}` : "",
+      notes.length ? `notes: ${notes.join("; ")}` : "",
+      errs.length ? `\nkey errors:\n  ${errs.slice(0, 5).join("\n  ")}` : "",
+      warns.length ? `\nkey warnings:\n  ${warns.slice(0, 5).join("\n  ")}` : "",
+    ].filter((s) => s !== "");
+    const sections =
+      middle > 0
+        ? `--- head ---\n${head}\n[...${middle} middle lines trimmed...]\n--- tail ---\n${tail}`
+        : joined.length > safeBudget
+          // One giant line (e.g. a single 50 KB JSON blob): still truncate, or
+          // the "budget" clamps nothing at all.
+          ? `${head}\n[...truncated...]\n${tail}`
+          : joined;
+    return summary.join("\n") + "\n" + sections;
+  };
+  // Two passes so the reported size is the real final size.
+  let text = render(0);
+  text = render(text.length);
 
   return { text, stats: { exitCode, rawLen, compacted: text.length, dupSaved } };
 }

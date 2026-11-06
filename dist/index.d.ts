@@ -1,6 +1,9 @@
 declare const _default: import("openclaw/plugin-sdk/tool-plugin").DefinedToolPluginEntry;
 export default _default;
-export declare function compactLines(stdout: string, stderr: string, budget: number, exitCode: number, ms: number): {
+export declare function compactLines(stdout: string, stderr: string, budget: number, exitCode: number, ms: number, flags?: {
+    timedOut?: boolean;
+    overflow?: boolean;
+}): {
     text: string;
     stats: {
         exitCode: number;
